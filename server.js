@@ -87,4 +87,4 @@ app.delete('/pdfs/:id', (req, res) => {
   });
 });
 
-app.listen(PORT, () => console.log(`Servidor corriendo en http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(`Server corriendo en http://localhost:${PORT}`));
