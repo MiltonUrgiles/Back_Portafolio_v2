@@ -1,91 +1,108 @@
 const express = require('express');
 const multer = require('multer');
 const cors = require('cors');
-const fs = require('fs');
-const path = require('path');
+const sql = require('mssql');
+
 const app = express();
-const PORT = 5000;
+const PORT = process.env.PORT || 5000;
 
 app.use(cors());
 app.use(express.json());
-app.use('/uploads', express.static('uploads'));
 
-const storage = multer.diskStorage({
-  destination: (_, file, cb) => cb(null, '/uploads'),
+// Multer en memoria
+const upload = multer({ storage: multer.memoryStorage() });
 
-  filename: (_, file, cb) => cb(null, Date.now() + '-' + file.originalname),
-});
-const upload = multer({ storage });
+const dbConfig = {
+  user: 'Sachi_SQLLogin_3',
+  password: '912fnf1g7h',
+  server: 'portafodb.mssql.somee.com',
+  database: 'portafodb',
+  options: {
+    encrypt: true,
+    trustServerCertificate: true,
+  },
+};
 
-const sqlite3 = require('sqlite3').verbose();
-const db = new sqlite3.Database('pdfs.db');
+let pool;
 
-// Crear tabla si no existe
-db.run(`CREATE TABLE IF NOT EXISTS pdfs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  nombre TEXT,
-  categoria TEXT,
-  parcial TEXT,
-  ruta TEXT
-)`);
+async function getPool() {
+  if (!pool) {
+    pool = await sql.connect(dbConfig);
+  }
+  return pool;
+}
 
 // Subir PDF
-app.post('/upload', upload.single('pdf'), (req, res) => {
+app.post('/upload', upload.single('pdf'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No se envió archivo' });
+
   const { categoria, parcial } = req.body;
   const nombre = req.file.originalname;
-  const ruta = req.file.path.replace(/\\/g, '/');
+  const archivo = req.file.buffer;
+  const tipo = req.file.mimetype;
 
-  db.run(
-    'INSERT INTO pdfs (nombre, categoria, parcial, ruta) VALUES (?, ?, ?, ?)',
-    [nombre, categoria, parcial, ruta],
-    function(err) {
-      if (err) return res.sendStatus(500);
-      res.json({ id: this.lastID });
-    }
-  );
+  try {
+    const pool = await getPool();
+    await pool.request()
+      .input('Nombre', sql.NVarChar, nombre)
+      .input('Categoria', sql.NVarChar, categoria)
+      .input('Parcial', sql.NVarChar, parcial)
+      .input('Archivo', sql.VarBinary(sql.MAX), archivo)
+      .input('Tipo', sql.NVarChar, tipo)
+      .query(`
+        INSERT INTO Pdfs (Nombre, Categoria, Parcial, Archivo, Tipo)
+        VALUES (@Nombre, @Categoria, @Parcial, @Archivo, @Tipo)
+      `);
+
+    res.status(200).json({ message: 'PDF guardado en SQL Server correctamente' });
+  } catch (err) {
+    console.error('Error al guardar en SQL Server:', err);
+    res.sendStatus(500);
+  }
 });
 
-// Obtener PDFs por parcial y categoría con reparación UTF-8 en nombres
-app.get('/pdfs', (req, res) => {
+// Obtener PDFs (metadatos)
+app.get('/pdfs', async (req, res) => {
   const { parcial, categoria } = req.query;
-  db.all(
-    'SELECT * FROM pdfs WHERE parcial = ? AND categoria = ?',
-    [parcial, categoria],
-    (err, rows) => {
-      if (err) return res.sendStatus(500);
 
-      // Reparar nombres corruptos (de latin1 a utf8)
-      rows = rows.map(row => ({
-        ...row,
-        nombre: Buffer.from(row.nombre, 'latin1').toString('utf8'),
-        ruta: row.ruta.replace(/\\/g, '/'), // aseguramos barras /
-      }));
+  try {
+    const pool = await getPool();
+    const result = await pool.request()
+      .input('Parcial', sql.NVarChar, parcial)
+      .input('Categoria', sql.NVarChar, categoria)
+      .query(`
+        SELECT Id, Nombre, Categoria, Parcial, Tipo FROM Pdfs
+        WHERE Parcial = @Parcial AND Categoria = @Categoria
+      `);
 
-      res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.json(rows);
-    }
-  );
+    res.json(result.recordset);
+  } catch (err) {
+    console.error('Error al obtener PDFs:', err);
+    res.sendStatus(500);
+  }
 });
 
-// Eliminar PDF (asegurar ruta correcta y manejo de errores)
-app.delete('/pdfs/:id', (req, res) => {
-  const id = req.params.id;
-  db.get('SELECT ruta FROM pdfs WHERE id = ?', [id], (err, row) => {
-    if (err) return res.sendStatus(500);
-    if (!row) return res.sendStatus(404);
+// Descargar PDF por ID
+app.get('/pdfs/:id/download', async (req, res) => {
+  const id = parseInt(req.params.id);
+  if (isNaN(id)) return res.status(400).json({ error: 'ID inválido' });
 
-    const filePath = path.resolve(row.ruta.replace(/\//g, path.sep)); // ruta absoluta y correcta
-    fs.unlink(filePath, (unlinkErr) => {
-      if (unlinkErr) {
-        console.error('Error eliminando archivo:', unlinkErr);
-        return res.sendStatus(500);
-      }
-      db.run('DELETE FROM pdfs WHERE id = ?', [id], err => {
-        if (err) return res.sendStatus(500);
-        res.sendStatus(200);
-      });
-    });
-  });
+  try {
+    const pool = await getPool();
+    const result = await pool.request()
+      .input('Id', sql.Int, id)
+      .query('SELECT Nombre, Archivo, Tipo FROM Pdfs WHERE Id = @Id');
+
+    if (result.recordset.length === 0) return res.sendStatus(404);
+
+    const { Nombre, Archivo, Tipo } = result.recordset[0];
+    res.setHeader('Content-Disposition', `attachment; filename="${Nombre}"`);
+    res.setHeader('Content-Type', Tipo);
+    res.send(Archivo);
+  } catch (err) {
+    console.error('Error al descargar PDF:', err);
+    res.sendStatus(500);
+  }
 });
 
-app.listen(PORT, () => console.log(`Server corriendo en http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(`Servidor corriendo en http://ngroc:${PORT}`));
